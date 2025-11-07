@@ -1,0 +1,169 @@
+import requests
+import re
+import json
+import os
+from datetime import datetime, timezone, timedelta
+import time
+from zoneinfo import ZoneInfo  # Python 3.9+
+import openstack
+import getpass
+
+import math
+
+
+
+
+# === CONFIG ===
+API_URL = "http://10.196.242.62/metrics"
+UPDATE_INTERVAL = 60  # 1 minutes in seconds
+FILTER_FIELD = "publisher"  # can be developer, publisher, etc.
+FILTER_VALUE = "Valve"      # configurable later
+MAX_VMS = 999999999999
+PLAYERS_PER_VM = 40000  # adjust based on your server capacity
+
+
+# === OpenStack authentication (using application credentials) ===
+os.environ["OS_AUTH_TYPE"] = "v3applicationcredential"
+os.environ["OS_AUTH_URL"] = "https://pegasus.sky.oslomet.no:5000"
+os.environ["OS_IDENTITY_API_VERSION"] = "3"
+os.environ["OS_REGION_NAME"] = "Pilestredet"
+os.environ["OS_INTERFACE"] = "public"
+os.environ["OS_APPLICATION_CREDENTIAL_ID"] = "51bec6c79e8948d1a778b20841593757"
+os.environ["OS_APPLICATION_CREDENTIAL_SECRET"] = "mkWSM2RiqtMINzZjcETtOAS2GFScHo5T6CtxW4cPW6s9lK4ajVrTd93q5tnNbCO7GO7FtzFZcvF5R3ghPZ5FGQ"
+
+# === Connect ===
+conn = openstack.connect(cloud=None)
+
+print("✅ Connected to OpenStack! Listing servers:\n")
+
+best_to_close = None
+closest_to_full_hour = 0  # in seconds
+total_cost = 0            # Sum of paid costs for all servers
+Hourly_cost = 0           # Sum for current partial hours (optional if different)
+running_vms = 0            # Number of running servers/VMs
+
+header = f"{'NAME':<25} {'STATUS':<10} {'STARTED AT':<25} {'UPTIME':<15} {'PAID HRS':<10} {'COST ($)':<10}"
+print(header)
+print("-" * len(header))
+
+for server in conn.compute.servers():
+    # Make sure server has a launch time
+    if not server.launched_at:
+        print(f"{server.name:<25} {server.status:<10} {'N/A':<25} {'N/A':<15} {'N/A':<10} {'N/A':<10}")
+        continue
+
+    started_at_str = server.launched_at
+
+    # Convert to aware datetime (UTC)
+    try:
+        if started_at_str.endswith("Z"):
+            started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+        else:
+            started_at = datetime.fromisoformat(started_at_str)
+        if started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+    except Exception as e:
+        print(f"Could not parse launch time for {server.name}: {e}")
+        continue
+
+    now = datetime.now(timezone.utc)
+    uptime = now - started_at
+
+    hours, remainder = divmod(uptime.total_seconds(), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    
+    paid_hours = math.ceil(uptime.total_seconds() / 3600)
+    cost = paid_hours * 100
+    total_cost += cost
+    running_vms += 1
+    Hourly_cost = running_vms * 100  # could be adjusted differently if you want only partial hour costs
+
+    uptime_str = f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+    started_at_str_fmt = started_at.strftime('%Y-%m-%d %H:%M:%S')
+
+    print(f"{server.name:<25} {server.status:<10} {started_at_str_fmt:<25} {uptime_str:<15} {paid_hours:<10} {cost:<10}")
+
+    seconds_into_current_hour = uptime.total_seconds() % 3600
+    if seconds_into_current_hour > closest_to_full_hour:
+        closest_to_full_hour = seconds_into_current_hour
+        best_to_close = server.name
+
+print("-" * len(header))
+# Print all totals
+print(f"{'TOTAL (Running VMs)':<25} {'':<10} {'':<25} {'':<15} {'':<10} {running_vms:<10}")
+print(f"{'Hourly Costs':<25} {'':<10} {'':<25} {'':<15} {'':<10} ${Hourly_cost:<10}")
+print(f"{'TOTAL (All Costs)':<25} {'':<10} {'':<25} {'':<15} {'':<10} ${total_cost:<10}")
+
+if best_to_close:
+    print("\n💡 Server with most value to close now:")
+    print(f"   {best_to_close} (closest to completing a full hour)\n")
+
+
+
+
+
+
+
+# Placeholder logic for VM count (can be more sophisticated later)
+def calculate_vm_count(player_count):
+    """Calculate number of VMs needed, capped at MAX_VMS."""
+    required_vms = max(1, (player_count + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM)  # ceil division
+    return min(required_vms, MAX_VMS)
+
+    
+
+# === FOLDERS & FILES ===
+DATA_DIR = "data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "games.json")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+while True:
+    start_time = datetime.now(ZoneInfo("Europe/Oslo"))
+
+    # === FETCH METRICS ===
+    response = requests.get(API_URL)
+    lines = response.text.splitlines()
+
+    # === PARSE GAMES ===
+    games = []
+
+    for line in lines:
+        if f'{FILTER_FIELD}="{FILTER_VALUE}"' in line:
+            title_match = re.search(r'title="([^"]+)"', line)
+            count_match = re.search(r'\s(\d+)$', line)
+
+            if title_match and count_match:
+                title = title_match.group(1)
+                player_count = int(count_match.group(1))
+                vm_count = calculate_vm_count(player_count)
+
+                games.append({
+                    "id": f"game-{len(games)+1}",
+                    "name": title,
+                    "developer": FILTER_VALUE,
+                    "player_count": player_count,
+                    "vm_count": vm_count,
+                    "scaling_strategy": "pending",
+                    "vms": [],
+                    "total_cost": 0,
+                    "last_updated": start_time.isoformat() + "Z"
+                })
+
+    # === BUILD FINAL STRUCTURE ===
+    data = {"games": games}
+
+    # === WRITE TO JSON (overwrite existing) ===
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"✅ Wrote {len(games)} games to {OUTPUT_FILE}")
+
+    # === OPTIONAL: summary print ===
+    for game in games:
+        print(f"{game['name']} ({game['player_count']} players, {game['vm_count']} VMs)")
+
+    # === NEXT RUN TIME ===
+    next_run = start_time + timedelta(seconds=UPDATE_INTERVAL)
+    print(f"⏱ Neste oppdatering klokken {next_run.strftime('%Y-%m-%d %H:%M:%S')} (Norsk tid)")
+
+    time.sleep(UPDATE_INTERVAL)
