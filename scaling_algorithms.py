@@ -4,7 +4,7 @@ import os
 from datetime import datetime
 from config import PLAYERS_PER_VM, LOG_FILE
 
-def calculate_vm_count(player_count: int, threshold_percent: float) -> int:
+def calculate_vm_count(player_count: int, threshold_percent: float) :
     """Generic VM calculation based on threshold_percent remaining."""
     vm_count = max(1, (player_count + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM)  # ceil division
     remaining_capacity_percent = 100 - (player_count / (vm_count * PLAYERS_PER_VM) * 100)
@@ -13,15 +13,15 @@ def calculate_vm_count(player_count: int, threshold_percent: float) -> int:
         vm_count += 1
     return vm_count
 
-def calculate_aggressive(player_count: int) -> int:
+def calculate_aggressive(player_count: int) :
     """Aggressive: scale when 10% remaining."""
     return calculate_vm_count(player_count, threshold_percent=10)
 
-def calculate_normal(player_count: int) -> int:
+def calculate_normal(player_count: int) :
     """Normal: scale when 5% remaining."""
     return calculate_vm_count(player_count, threshold_percent=5)
 
-def calculate_passive(player_count: int) -> int:
+def calculate_passive(player_count: int) :
     """Passive: scale when 2% remaining."""
     return calculate_vm_count(player_count, threshold_percent=2)
 
@@ -36,63 +36,94 @@ def get_scaling_function(strategy: str):
     return mapping.get(strategy, calculate_normal)
 
 
-# --- trend_based.py ---
+# --- trend_based ---
 
 def calculate_trend_vm_count(
     current_count: int,
     previous_count: int,
     current_vms: int = None,
     min_vms: int = 1,
-    aggressive_threshold: float = 0.5,  # prosent av én VM
-    PLAYERS_PER_VM: int = 500,
-) -> int:
-    """
-    Trend + kapasitet-basert skalering:
-    - Vurderer hvor mange spillere endringen tilsvarer i forhold til VM-kapasitet.
-    - Små endringer under en viss prosent av én VM ignoreres (for å unngå støy).
-    - Store endringer over flere VM-kapasiteter skalerer mer aggressivt.
-    """
+    threshold_percent: float = 95.0,
+    respect_current_load: bool = True,
+) :
 
-    if previous_count is None:
-        previous_count = current_count
+    print("\n───────────────────────────────")
+    print("🧠 CALCULATE TREND VM COUNT DEBUG (v2)")
+    print(f"📊 current_count: {current_count}, previous_count: {previous_count}, current_vms: {current_vms}")
+    print(f"⚙ respect_current_load: {respect_current_load}, min_vms: {min_vms}, threshold%: {threshold_percent}")
 
     if current_vms is None:
         current_vms = max(min_vms, (current_count + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM)
+        print(f"ℹ️ current_vms var None → kalkulert: {current_vms}")
 
-    # Beregn endring
+    # Predict
     diff = current_count - previous_count
-    change_percent = ((diff) / previous_count * 100) if previous_count > 0 else 0
+    next_trend_count = current_count + diff
+    print(f"📈 Predicted next count: {next_trend_count} (diff: {diff})")
 
-    # Hvor mye kapasitet er brukt
-    capacity_percent_used = (current_count / (current_vms * PLAYERS_PER_VM)) * 100
-
-    # Hvor mange "VM-er" utgjør endringen
-    vm_equiv_change = diff / PLAYERS_PER_VM
+    # Capacity calculation
+    last_vm_capacity = int(PLAYERS_PER_VM * threshold_percent)
+    safe_total_capacity = (current_vms - 1) * PLAYERS_PER_VM + last_vm_capacity
+    print(f"📦 Safe capacity @ {current_vms} VMs: {safe_total_capacity} (last VM: {last_vm_capacity})")
 
     new_vms = current_vms
     decision = "ingen endring"
 
-    # --- Skalering basert på VM-ekvivalent endring ---
-    if vm_equiv_change >= aggressive_threshold:
-        # Økning tilsvarer minst 0.5 VM → skaler raskere
-        add_vms = int(round(vm_equiv_change))
-        new_vms += max(1, add_vms)
-        decision = f"⚡ Skalerer opp (+{max(1, add_vms)} VM)"
-    elif vm_equiv_change <= -aggressive_threshold and capacity_percent_used < 60:
-        # Nedgang tilsvarer minst 0.5 VM, og lav utnyttelse
-        remove_vms = int(round(abs(vm_equiv_change)))
-        new_vms = max(min_vms, new_vms - max(1, remove_vms))
-        decision = f"🧊 Skalerer ned (-{max(1, remove_vms)} VM)"
+    # ---------------- SCALE UP ---------------- #
+    if next_trend_count > safe_total_capacity:
+        print("⚠️ Skal opp: predicted > safe capacity")
 
-    # --- Sikring mot over/underkapasitet ---
-    if capacity_percent_used > 95:
-        new_vms += 1
-        decision = "🚨 Nød-skalering opp (+1 VM)"
-    elif capacity_percent_used < 35 and new_vms > min_vms:
-        new_vms -= 1
-        decision = "🌙 Lav utnyttelse (-1 VM)"
+        extra_players = next_trend_count - ((current_vms - 1) * PLAYERS_PER_VM)
+        needed_vms_est = current_vms - 1 + int(-(-extra_players // last_vm_capacity))
+        new_vms = max(min_vms, needed_vms_est)
+
+        print(f"🔄 Før sikkerhetsjekk: {new_vms} VMs ønsket")
+
+        # Safety check loop
+        while True:
+            safe_cap_check = (new_vms - 1) * PLAYERS_PER_VM + last_vm_capacity
+            print(f"  ➤ Sjekker {new_vms} VMs → {safe_cap_check} safe")
+
+            if next_trend_count <= safe_cap_check:
+                break
+            print("  ❌ Ikke trygt → +1 VM")
+            new_vms += 1
+
+        decision = f"⚡ Oppskalering → {new_vms} VMs"
+
+    # ---------------- SCALE DOWN ---------------- #
+    elif next_trend_count < current_count:
+        print("📉 Potensial for nedskalering")
+
+        # Direct right-sizing using actual load
+        ideal_vms = max(
+            min_vms,
+            int(-((current_count - last_vm_capacity) // -PLAYERS_PER_VM)) + 1
+            if current_count > last_vm_capacity else 1
+        )
+
+        print(f"🧮 Beregnet ideell VMs for faktisk load: {ideal_vms}")
+
+        if respect_current_load:
+            safe_current_cap = (ideal_vms - 1) * PLAYERS_PER_VM + last_vm_capacity
+            print(f"   🔐 Sikker sjekk mot threshold → {safe_current_cap}")
+
+        if ideal_vms < current_vms:
+            new_vms = ideal_vms
+            decision = f"🧊 Nedskalering → {new_vms} VMs"
+
+    # Final logging
+    safe_final_cap = (new_vms - 1) * PLAYERS_PER_VM + last_vm_capacity
+    print(f"🔥 Final VMs: {new_vms}, Safe capacity: {safe_final_cap}")
+    print(f"➡️ Decision: {decision}")
+    print("───────────────────────────────\n")
 
     return new_vms
+
+
+
+
+
 
 
 
@@ -169,15 +200,15 @@ def calculate_predictive_scaling(
     current_vms: int,
     time_offset_hours: int = -6,
     lookahead_intervals: int = 3,
-    PLAYERS_PER_VM: int = 500,
-    scale_up_threshold: float = 0.9,   # 90% full
-    scale_down_threshold: float = 0.5  # 50% full
+    PLAYERS_PER_VM: int = PLAYERS_PER_VM,
+    buffer: int = 75,
+    respect_current_load: bool = False,
 ):
     """
-    Predictive scaling med sikkerhetsmarginer.
-    - Skalerer opp når forventet bruk > scale_up_threshold * kapasitet
-    - Skalerer ikke ned før faktisk bruk er under scale_down_threshold
-    - Aldri skaler ned basert på forventet nedgang før den faktisk skjer
+    Predictive scaling basert på nåværende avvik.
+    - Sammenligner faktisk spillerantall med forventet (nå)
+    - Beregner neste forventning justert med nåværende avvik (%)
+    - Returnerer nytt VM-forslag og korrigert neste forventning
     """
 
     print("\n───────────────────────────────")
@@ -187,6 +218,7 @@ def calculate_predictive_scaling(
     print(f"👥 Spillere nå: {current_player_count}")
     print(f"🖥️ Aktive VMs nå: {current_vms}")
 
+    # Juster time for mønsterdata (timezone/historikk)
     adjusted_hour = (int(current_hour) + time_offset_hours) % 24
     adjusted_hour_str = f"{adjusted_hour:02d}"
     print(f"🕕 Bruker mønsterdata for time: {adjusted_hour_str}")
@@ -197,11 +229,12 @@ def calculate_predictive_scaling(
         print("⚠️ Ingen historisk data for nåværende tidspunkt — ingen endring.")
         return current_vms, None, 0.0
 
+    # Beregn prosentvis avvik nå
     deviation_now = (current_player_count - expected_now) / expected_now
     print(f"📊 Forventet nå: {expected_now:.0f}")
     print(f"📏 Avvik nå: {(deviation_now * 100):+.1f}%")
 
-    # Neste forventning (lookahead)
+    # Finn neste forventning (lookahead)
     total_minutes_ahead = 5 * lookahead_intervals
     next_minute_total = int(current_minute) + total_minutes_ahead
     next_hour = (adjusted_hour + next_minute_total // 60) % 24
@@ -214,70 +247,59 @@ def calculate_predictive_scaling(
         print("⚠️ Ingen data for neste intervall — ingen endring.")
         return current_vms, None, deviation_now
 
+    # Korriger neste forventning med nåværende avvik
     corrected_future = expected_next * (1 + deviation_now)
     print(f"📈 Neste forventet: {expected_next:.0f}")
-    print(f"🧮 Korrigert neste: {corrected_future:.0f}")
+    print(f"🧮 Korrigert neste: {corrected_future:.0f} (avvik {deviation_now*100:+.1f}%)")
 
-    # --- Kapasitetsberegning ---
-    capacity_now = current_vms * PLAYERS_PER_VM
-    avg_load_per_vm = current_player_count / current_vms
-    utilization = current_player_count / capacity_now
+    # --- Beregn nødvendige VMer basert på forecast og buffer ---
+    required_vms = max(1, (corrected_future + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM)
 
-    print(f"⚙️  Nåværende total utnyttelse: {utilization*100:.1f}% (kapasitet {capacity_now} spillere)")
-    print(f"📦 Gjennomsnittlig last per VM: {avg_load_per_vm:.1f}/{PLAYERS_PER_VM} spillere")
+    players_on_last_vm = corrected_future % PLAYERS_PER_VM
+    if players_on_last_vm == 0:
+        players_on_last_vm = PLAYERS_PER_VM
 
-    required_vms = current_vms  # default: ingen endring
+    remaining_capacity = PLAYERS_PER_VM - players_on_last_vm
 
-    # --- Per-VM basert skalering opp basert på siste VM ---
-    players_in_last_vm = current_player_count % PLAYERS_PER_VM
-    if players_in_last_vm == 0:
-        players_in_last_vm = PLAYERS_PER_VM  # siste VM er full
+    print(f"📦 Forecast: {corrected_future} spillere, kapasitet på siste VM: {remaining_capacity}")
 
-    remaining_capacity_last_vm = PLAYERS_PER_VM - players_in_last_vm
-    per_vm_remaining_threshold = 100  # skaler når mindre enn 100 spillere igjen på siste VM
-
-    print(f"📦 Ledig kapasitet siste VM: {remaining_capacity_last_vm} spillere")
-
-    if remaining_capacity_last_vm <= per_vm_remaining_threshold:
-        required_vms = current_vms + 1
-        print(f"⬆️  Skalerer OPP: siste VM nærmer seg full (≤{per_vm_remaining_threshold} spillere igjen)")
+    if remaining_capacity < buffer:
+        required_vms += 1
+        print(f"⬆️ Skalerer opp: mindre enn {buffer} plasser igjen på siste VM")
 
 
+     # --- 👇 Sikring mot underkapasitet (valgfritt) ---
+    if respect_current_load:
+        min_required = (current_player_count + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM
+        if required_vms < min_required:
+            print(f"⚠️ Forhindrer nedskalering: behold {min_required} VMs (nåværende behov).")
+            required_vms = min_required
 
-    # --- Backup: fremtidsbasert oppskalering ---
-    elif corrected_future > capacity_now * scale_up_threshold:
-        base_vms = int((corrected_future + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM)
-        required_vms = max(current_vms + 1, base_vms)
-        print(f"⬆️  Skalerer OPP (framtid): forventet {corrected_future:.0f} spillere > {scale_up_threshold*100:.0f}% terskel")
+    print(f"💡 Totalt foreslått VM-antall: {required_vms}")
 
-    # --- Ingen skalering opp ---
-    else:
-        print("⚖️  Ingen skalering opp nødvendig akkurat nå.")
-
-    # --- Skalering ned (separer med egen if) ---
-    if utilization < scale_down_threshold:
-        target_vms = int((current_player_count + PLAYERS_PER_VM - 1) // PLAYERS_PER_VM)
-        if target_vms < required_vms:
-            required_vms = target_vms
-            print(f"⬇️  Skalerer NED: faktisk bruk {utilization*100:.1f}% < {scale_down_threshold*100:.0f}% terskel")
-        else:
-            print("ℹ️  Nedskalering vurdert men ikke nødvendig.")
-
-
-    # --- Logg endringen ---
+    
+    # Legg til logging:
     log_vm_change(
-        game_name="CounterStrike",
+        game_name="CounterStrike",  # du må sende inn spillets navn til funksjonen
         current_day=current_day,
         current_hour=current_hour,
         current_minute=current_minute,
         current_players=current_player_count,
         expected_now=expected_now,
-        deviation_now=deviation_now,
         expected_next=expected_next,
+        required_vms=required_vms,
         corrected_future=corrected_future,
-        required_vms=required_vms
+        deviation_now=deviation_now
     )
 
+
     print(f"💡 Foreslått VM-antall: {required_vms}")
+
     print("───────────────────────────────\n")
     return required_vms, corrected_future, deviation_now
+
+
+
+
+
+

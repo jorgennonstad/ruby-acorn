@@ -1,19 +1,16 @@
 import time
 from config import UPDATE_INTERVAL
-from openstack_utils import connect, list_servers, print_servers, recommend_shutdown
+from openstack_utils import connect, list_servers, recommend_shutdown
 from metrics_fetcher import fetch_and_write_metrics
 
 def main():
-    conn = connect()
-    servers = list_servers(conn)
-    recommendations = recommend_shutdown(servers, min_uptime_for_shutdown=50)
-
-
-
+    conn = connect()  # connect once at start
 
     while True:
-        fetch_and_write_metrics()
+        fetch_and_write_metrics(conn=conn)
+
         time.sleep(UPDATE_INTERVAL)
+
 
 if __name__ == "__main__":
     main()

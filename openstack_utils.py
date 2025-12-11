@@ -1,40 +1,52 @@
+# openstack_utils.py
 import openstack
+import time
+from openstack import exceptions
 from datetime import datetime, timezone
 import math
-import time
 from config import (
-    HOURLY_PRICE, PLAYERS_PER_VM, MAX_VMS,
+    HOURLY_PRICE, IMAGE_ID, FLAVOR_ID, NETWORK_ID,
+    KEYPAIR_NAME, SECURITY_GROUP,
     OS_AUTH_TYPE, OS_AUTH_URL, OS_APPLICATION_CREDENTIAL_ID,
-    OS_APPLICATION_CREDENTIAL_SECRET, OS_REGION_NAME, OS_INTERFACE
+    OS_APPLICATION_CREDENTIAL_SECRET, OS_REGION_NAME, OS_INTERFACE, MIN_MINUTES_TO_NEXT_HOUR_FOR_SHUTDOWN
 )
+
 
 def connect():
     """
-    Oppretter forbindelse til OpenStack med credentials fra config.py
+    Connect to OpenStack using credentials from config.py
     """
-    conn = openstack.connect(
-        auth_type=OS_AUTH_TYPE,
-        auth_url=OS_AUTH_URL,
-        application_credential_id=OS_APPLICATION_CREDENTIAL_ID,
-        application_credential_secret=OS_APPLICATION_CREDENTIAL_SECRET,
-        region_name=OS_REGION_NAME,
-        interface=OS_INTERFACE
-    )
-    return conn
+    try:
+        conn = openstack.connect(
+            auth_type=OS_AUTH_TYPE,
+            auth_url=OS_AUTH_URL,
+            application_credential_id=OS_APPLICATION_CREDENTIAL_ID,
+            application_credential_secret=OS_APPLICATION_CREDENTIAL_SECRET,
+            region_name=OS_REGION_NAME,
+            interface=OS_INTERFACE
+        )
+        return conn
+    except Exception as e:
+        print(f"❌ Failed to connect to OpenStack: {e}")
+        return None
+
 
 def list_servers(conn):
     """
-    Henter info om alle servere og returnerer en struktur med relevant info:
+    List all VMs excluding manager and return info:
     - name
     - status
-    - launched_at (datetime)
+    - launched_at
     - uptime (timedelta)
     - paid_hours
     - cost
     """
     servers_info = []
-
     for server in conn.compute.servers():
+        if "manager" in server.name.lower():
+            continue
+
+        # Handle missing launch info
         if not server.launched_at:
             servers_info.append({
                 "name": server.name,
@@ -73,92 +85,25 @@ def list_servers(conn):
             "paid_hours": paid_hours,
             "cost": cost
         })
+
     return servers_info
 
-def start_vm(vm_name, conn):
-    """
-    Starter en VM og venter til den er operativ.
-    """
-    # TODO: implementer faktisk API-kall
-    operational = False
-    while not operational:
-        status = "ACTIVE"  # placeholder
-        if status == "ACTIVE":
-            operational = True
-        else:
-            time.sleep(1)
-    return True
 
-def stop_vm(vm_name, conn):
+def recommend_shutdown(servers_info):
     """
-    Stopper en VM og venter til den er stoppet.
+    Return VMs sorted by who is closest to next full hour.
+    Marks which VMs are eligible for shutdown.
+    Prints debug info showing uptime and recommendation.
     """
-    # TODO: implementer faktisk API-kall
-    stopped = False
-    while not stopped:
-        status = "SHUTOFF"  # placeholder
-        if status == "SHUTOFF":
-            stopped = True
-        else:
-            time.sleep(1)
-    return True
 
-
-def calculate_vm_count(player_count, players_per_vm=PLAYERS_PER_VM, max_vms=MAX_VMS):
-    """
-    Beregner antall VMer basert på antall spillere.
-    """
-    required_vms = max(1, (player_count + players_per_vm - 1) // players_per_vm)
-    return min(required_vms, max_vms)
-
-
-
-
-def print_servers(servers_info):
-    """
-    Printer info om servere i en tabell-lignende stil.
-    """
-    print("\n=== OpenStack VM Status ===")
-    print(f"{'Name':25} {'Status':10} {'Uptime':15} {'Hours':>5} {'Cost($)':>7} {'Launched At':20}")
-    print("-" * 90)
-    
-    for s in servers_info:
-        name = s["name"][:25]
-        status = s["status"]
-        uptime = str(s["uptime"]).split(".")[0] if s["uptime"] else "-"
-        paid_hours = s["paid_hours"]
-        cost = f"{s['cost']:.2f}"
-        launched_at = s["launched_at"].strftime("%Y-%m-%d %H:%M:%S") if s["launched_at"] else "-"
-        
-        print(f"{name:25} {status:10} {uptime:15} {paid_hours:5} {cost:7} {launched_at:20}")
-    print("-" * 90)
-
-
-def recommend_shutdown(servers_info, min_uptime_for_shutdown=50):
-    """
-    Lager en liste over VMer sortert etter hvor nærme de er neste hele time.
-    Marker hvilke som kan shuttes ned.
-    
-    Args:
-        servers_info: Liste med serverdata fra list_servers()
-        min_uptime_for_shutdown: Minimum minutter over hele timer før shutdown kan vurderes
-    
-    Returns:
-        List med dicts: name, uptime, minutes_to_next_hour, recommend_shutdown
-    """
     recommendations = []
-
     for s in servers_info:
         if not s["uptime"]:
-            # Ignorer servere uten uptime info
             continue
-
         total_minutes = s["uptime"].total_seconds() / 60
         minutes_past_hour = total_minutes % 60
         minutes_to_next_hour = 60 - minutes_past_hour
-
-        # Kan shuttes ned hvis den har vært oppe mer enn min_uptime_for_shutdown minutter over hele timer
-        can_shutdown = minutes_past_hour >= min_uptime_for_shutdown
+        can_shutdown = minutes_to_next_hour <= MIN_MINUTES_TO_NEXT_HOUR_FOR_SHUTDOWN
 
         recommendations.append({
             "name": s["name"],
@@ -168,16 +113,109 @@ def recommend_shutdown(servers_info, min_uptime_for_shutdown=50):
             "recommend_shutdown": can_shutdown
         })
 
-    # Sorter etter hvor nærme neste hele time (minimale minutter_to_next_hour først)
+    # Sort by minutes to next hour (ascending)
     recommendations.sort(key=lambda x: x["minutes_to_next_hour"])
-    
-    # Print tabell
-    print(f"\n{'Name':25} {'Uptime':15} {'Past min':>9} {'To next hour':>13} {'Shutdown?':>10}")
-    print("-"*75)
+
+    # --- DEBUG PRINT ---
+    print("\n🛠 Shutdown recommendations (for debugging, not deleting):")
+    print(f"{'VM Name':25} {'Uptime':20} {'Past min':10} {'To next hour':13} {'Shutdown?':10}")
+    print("-" * 85)
     for r in recommendations:
         uptime_str = str(r["uptime"]).split(".")[0]
         shutdown_str = "YES" if r["recommend_shutdown"] else "NO"
-        print(f"{r['name']:25} {uptime_str:15} {r['minutes_past_hour']:9.0f} {r['minutes_to_next_hour']:13.0f} {shutdown_str:>10}")
-    print("-"*75)
+        print(f"{r['name']:25} {uptime_str:20} {r['minutes_past_hour']:10.0f} {r['minutes_to_next_hour']:13.0f} {shutdown_str:>10}")
+    print("-" * 85)
 
     return recommendations
+
+
+
+def start_vms(conn, count, base_name="GameVM"):
+    """
+    Start `count` VMs and generate names automatically.
+    Returns list of started VM names.
+    """
+    started = []
+    for i in range(count):
+        vm_name = f"{base_name}-{int(time.time())}-{i}"
+        try:
+            server = conn.compute.create_server(
+                name=vm_name,
+                image_id=IMAGE_ID,
+                flavor_id=FLAVOR_ID,
+                networks=[{"uuid": NETWORK_ID}],
+                key_name=KEYPAIR_NAME,
+                security_groups=[{"name": SECURITY_GROUP}]
+            )
+            conn.compute.wait_for_server(server, status="ACTIVE", failures=["ERROR"], interval=5, wait=300)
+            print(f"✅ VM '{vm_name}' started")
+            started.append(vm_name)
+        except exceptions.ForbiddenException as e:
+            print(f"⚠️ Quota exceeded or permission denied for '{vm_name}': {e}")
+        except exceptions.HttpException as e:
+            print(f"❌ HTTP error while starting '{vm_name}': {e}")
+        except Exception as e:
+            print(f"❌ Unexpected error while starting '{vm_name}': {e}")
+    return started
+
+
+def stop_vms(conn, count):
+    """
+    Delete up to `count` VMs using recommendations.
+    Never deletes manager VM.
+    Returns list of deleted VM names.
+    """
+
+    all_vms = list_servers(conn)
+    game_vms = [vm for vm in all_vms if "manager" not in vm["name"].lower()]
+    if not game_vms or count <= 0:
+        return []
+
+    recs = recommend_shutdown(game_vms)
+    candidates = [r for r in recs if r["recommend_shutdown"]]
+    print(f"🛠 VMs recommended for deletion: {[r['name'] for r in candidates]}")
+
+    if not candidates:
+        print("ℹ️ No VMs eligible for deletion")
+        return []
+
+    to_delete = candidates[:count]
+    deleted = []
+
+    for r in to_delete:
+        name = r["name"]
+        server = conn.compute.find_server(name)
+        if not server:
+            print(f"⚠️ VM '{name}' not found, skipping")
+            continue
+
+        if "manager" in server.name.lower():
+            print(f"⚙️ Skipping manager VM '{name}'")
+            continue
+
+        try:
+            print(f"🗑 Deleting VM '{name}'...")
+            conn.compute.delete_server(server)
+            # Wait until server disappears
+            for _ in range(60):  # max 5 minutes
+                if not conn.compute.find_server(name):
+                    print(f"✅ VM '{name}' deleted")
+                    deleted.append(name)
+                    break
+                time.sleep(5)
+            else:
+                print(f"⚠️ Timeout waiting for VM '{name}' to be deleted")
+        except Exception as e:
+            print(f"❌ Failed to delete VM '{name}': {e}")
+
+    return deleted
+
+
+
+def count_vms(conn):
+    """
+    Return number of game VMs (excluding manager)
+    """
+    all_vms = list_servers(conn)
+    game_vms = [vm for vm in all_vms if "manager" not in vm["name"].lower()]
+    return len(game_vms)
